@@ -18,29 +18,69 @@ app.get('/', (req, res) => {
 
 app.post('/spots', async (req, res) => {
   try {
+
     console.log('📥 POST Request Received');
     console.log(req.body);
 
     const {
-      title, description, category,
-      latitude, longitude, image_url,
+      title,
+      description,
+      category,
+      latitude,
+      longitude,
+      map_link,
+      location_label,
+      image_url,
       submitted_by_email
     } = req.body;
 
     const result = await pool.query(
-      `INSERT INTO spots
-       (title, description, category, latitude, longitude, image_url, submitted_by_email)
-       VALUES ($1,$2,$3,$4,$5,$6,$7)
-       RETURNING *`,
-      [title, description, category, latitude, longitude, image_url, submitted_by_email]
+      `
+      INSERT INTO spots
+      (
+        title,
+        description,
+        category,
+        latitude,
+        longitude,
+        map_link,
+        location_label,
+        image_url,
+        submitted_by_email
+      )
+      VALUES
+      ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+      RETURNING *
+      `,
+      [
+        title,
+        description,
+        category,
+        latitude,
+        longitude,
+        map_link,
+        location_label,
+        image_url,
+        submitted_by_email
+      ]
     );
 
     console.log('✅ Spot Saved');
-    res.json({ success: true, data: result.rows[0] });
+
+    res.status(201).json({
+      success: true,
+      data: result.rows[0]
+    });
 
   } catch (error) {
-    console.error('❌ ERROR', error);
-    res.status(500).json({ success: false, error: error.message });
+
+    console.error('❌ ERROR');
+    console.error(error);
+
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
   }
 });
 
