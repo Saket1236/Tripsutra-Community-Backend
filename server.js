@@ -6,6 +6,7 @@ const express = require('express');
 const cors = require('cors');
 const pool = require('./db');
 const cloudinary = require('./cloudinary');
+const cron = require('node-cron');
 
 const app = express();
 
@@ -25,6 +26,17 @@ if (
     '❌ Missing Cloudinary credentials in environment variables'
   );
 }
+
+
+// ─────────────────────────────────────────────────────────
+// CATEGORIES (keep in sync with Flutter's _kAllCategories)
+// ─────────────────────────────────────────────────────────
+
+const ALLOWED_CATEGORIES = [
+  'Food', 'Attraction', 'Monument', 'Nature',
+  'Trekking Spot', 'Waterfall', 'Temple', 'Park', 'Auditorium',
+  'Event'
+];
 
 
 // ─────────────────────────────────────────────────────────
@@ -77,6 +89,47 @@ async function deleteImageIfExists(imageUrl) {
       '⚠️ Cloudinary delete failed:',
       err.message
     );
+  }
+}
+
+
+// ─────────────────────────────────────────────────────────
+// EVENT CLEANUP
+// ─────────────────────────────────────────────────────────
+
+async function cleanupExpiredEvents() {
+  try {
+    console.log('🧹 Checking for expired events...');
+
+    const result = await pool.query(
+      `SELECT *
+       FROM spots
+       WHERE category = 'Event'
+       AND event_date IS NOT NULL
+       AND event_time IS NOT NULL
+       AND (event_date + event_time::interval)
+           < (NOW() AT TIME ZONE 'Asia/Kolkata')`
+    );
+
+    console.log(`🔍 Found ${result.rows.length} expired event(s)`);
+
+    for (const spot of result.rows) {
+      try {
+        await deleteImageIfExists(spot.image_url);
+
+        await pool.query('DELETE FROM spots WHERE id=$1', [spot.id]);
+
+        console.log(`🗑️ Expired event deleted: ${spot.title} (id: ${spot.id})`);
+      } catch (deleteError) {
+        console.error(`❌ Failed to delete event ${spot.id}:`, deleteError.message);
+      }
+    }
+
+    if (result.rows.length > 0) {
+      console.log(`✅ Event cleanup complete: ${result.rows.length} expired event(s) removed`);
+    }
+  } catch (error) {
+    console.error('⚠️ Event cleanup failed:', error);
   }
 }
 
@@ -315,6 +368,20 @@ app.put(
 
       const current = check.rows[0];
 
+      if (
+        youtube_url !== undefined
+      ) {
+        const youtubeRegex =
+          /(?:youtube\.com\/shorts\/|youtube\.com\/watch\?v=|youtu\.be\/)([a-zA-Z0-9_-]{11})/;
+
+        if (!youtubeRegex.test(youtube_url)) {
+          return res.status(400).json({
+            success: false,
+            error: 'Invalid YouTube URL'
+          });
+        }
+      }
+
       const result = await pool.query(
         `
         UPDATE travel_shorts
@@ -522,6 +589,13 @@ app.post('/spots', async (req, res) => {
       });
     }
 
+    if (!ALLOWED_CATEGORIES.includes(category)) {
+      return res.status(400).json({
+        success: false,
+        error: `Invalid category. Must be one of: ${ALLOWED_CATEGORIES.join(', ')}`
+      });
+    }
+
 
     // ─────────────────────────────────────────────────────
     // EVENT VALIDATION
@@ -643,19 +717,29 @@ app.get(
   '/approved-spots',
   async (req, res) => {
     try {
+      // Delete expired events whenever this endpoint is hit
+      // (covers the case where Render's cron didn't fire because the service was asleep)
+      await cleanupExpiredEvents();
+
       const result = await pool.query(
-        `
-        SELECT *
-        FROM spots
-        WHERE status = 'approved'
-        ORDER BY id DESC
-        `
+        `SELECT *
+         FROM spots
+         WHERE status = 'approved'
+         AND (
+           category != 'Event'
+           OR event_date IS NULL
+           OR event_time IS NULL
+           OR (event_date + event_time::interval)
+              >= (NOW() AT TIME ZONE 'Asia/Kolkata')
+         )
+         ORDER BY id DESC`
       );
 
       res.json(
         result.rows
       );
     } catch (error) {
+      console.error('❌ Approved spots error:', error);
       res.status(500).json({
         error: error.message
       });
@@ -757,7 +841,7 @@ app.delete(
 
 
 // ─────────────────────────────────────────────────────────
-// DELETE APPROVED SPOT
+// DELETE APPROVED SPOT (admin)
 // ─────────────────────────────────────────────────────────
 
 app.delete(
@@ -807,6 +891,59 @@ app.delete(
     }
   }
 );
+
+
+// ─────────────────────────────────────────────────────────
+// EDIT SPOT (admin — works for pending or approved)
+// ─────────────────────────────────────────────────────────
+
+app.put('/edit-spot/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { title, category, description, event_date, event_time } = req.body;
+
+    if (!title) {
+      return res.status(400).json({ success: false, error: 'title is required' });
+    }
+
+    if (!ALLOWED_CATEGORIES.includes(category)) {
+      return res.status(400).json({
+        success: false,
+        error: `Invalid category. Must be one of: ${ALLOWED_CATEGORIES.join(', ')}`
+      });
+    }
+
+    if (category === 'Event' && (!event_date || !event_time)) {
+      return res.status(400).json({
+        success: false,
+        error: 'event_date and event_time are required for Event category'
+      });
+    }
+
+    const result = await pool.query(
+      `UPDATE spots
+       SET title=$1, category=$2, description=$3, event_date=$4, event_time=$5
+       WHERE id=$6
+       RETURNING *`,
+      [
+        title,
+        category,
+        description ?? '',
+        category === 'Event' ? event_date : null,
+        category === 'Event' ? event_time : null,
+        id
+      ]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, error: 'Spot not found' });
+    }
+
+    res.json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
 
 
 // ─────────────────────────────────────────────────────────
@@ -922,12 +1059,29 @@ const PORT =
   process.env.PORT || 3000;
 
 
+// Event cleanup cron — runs every 15 minutes while the service is
+// awake, in IST
+cron.schedule(
+  '*/15 * * * *',
+  async () => {
+    console.log('⏰ Cron triggered');
+    await cleanupExpiredEvents();
+  },
+  {
+    timezone: 'Asia/Kolkata'
+  }
+);
+
+
 app.listen(
   PORT,
   '0.0.0.0',
-  () => {
+  async () => {
     console.log(
       `🚀 Server running on port ${PORT}`
     );
+
+    console.log('🧹 Running startup event cleanup...');
+    await cleanupExpiredEvents();
   }
 );
