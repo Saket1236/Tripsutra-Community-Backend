@@ -52,6 +52,7 @@ app.get('/', (req, res) => {
 
 app.post('/spots', async (req, res) => {
   try {
+
     console.log('📥 POST Request Received');
     console.log(req.body);
 
@@ -112,7 +113,7 @@ app.post('/spots', async (req, res) => {
       data: result.rows[0]
     });
 
-  } catch (error) {
+} catch (error) {
     console.error('❌ ERROR');
     console.error(error);
 
