@@ -47,6 +47,43 @@ async function deleteImageIfExists(imageUrl) {
   }
 }
 
+// ---- Event cleanup ----
+async function cleanupExpiredEvents() {
+  try {
+    console.log('🧹 Checking for expired events...');
+
+    const result = await pool.query(
+      `SELECT *
+       FROM spots
+       WHERE category = 'Event'
+       AND event_date IS NOT NULL
+       AND event_time IS NOT NULL
+       AND (event_date + event_time::interval)
+           < (NOW() AT TIME ZONE 'Asia/Kolkata')`
+    );
+
+    console.log(`🔍 Found ${result.rows.length} expired event(s)`);
+
+    for (const spot of result.rows) {
+      try {
+        await deleteImageIfExists(spot.image_url);
+
+        await pool.query('DELETE FROM spots WHERE id=$1', [spot.id]);
+
+        console.log(`🗑️ Expired event deleted: ${spot.title} (id: ${spot.id})`);
+      } catch (deleteError) {
+        console.error(`❌ Failed to delete event ${spot.id}:`, deleteError.message);
+      }
+    }
+
+    if (result.rows.length > 0) {
+      console.log(`✅ Event cleanup complete: ${result.rows.length} expired event(s) removed`);
+    }
+  } catch (error) {
+    console.error('⚠️ Event cleanup failed:', error);
+  }
+}
+
 // ---- Routes ----
 
 app.post('/test', (req, res) => {
@@ -164,11 +201,28 @@ app.get('/pending-spots', async (req, res) => {
 
 app.get('/approved-spots', async (req, res) => {
   try {
+    // Delete expired events whenever this endpoint is hit
+    // (covers the case where Render's cron didn't fire because the service was asleep)
+    await cleanupExpiredEvents();
+
     const result = await pool.query(
-      "SELECT * FROM spots WHERE status='approved' ORDER BY id DESC"
+      `SELECT *
+       FROM spots
+       WHERE status = 'approved'
+       AND (
+         category != 'Event'
+         OR event_date IS NULL
+         OR event_time IS NULL
+         OR (event_date + event_time::interval)
+            >= (NOW() AT TIME ZONE 'Asia/Kolkata')
+       )
+       ORDER BY id DESC`
     );
+
     res.json(result.rows);
+
   } catch (error) {
+    console.error('❌ Approved spots error:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -325,36 +379,24 @@ app.delete('/spots/user/:id', async (req, res) => {
   }
 });
 
-async function cleanupExpiredEvents() {
-  try {
-    const result = await pool.query(
-      `SELECT * FROM spots
-       WHERE category = 'Event'
-       AND event_date IS NOT NULL
-       AND event_time IS NOT NULL
-       AND (event_date + event_time::interval) < NOW()`
-    );
-
-    for (const spot of result.rows) {
-      await deleteImageIfExists(spot.image_url);
-      await pool.query('DELETE FROM spots WHERE id=$1', [spot.id]);
-      console.log(`🗑️ Expired event deleted: ${spot.title} (id: ${spot.id})`);
-    }
-
-    if (result.rows.length > 0) {
-      console.log(`✅ Cleanup complete: ${result.rows.length} expired event(s) removed`);
-    }
-  } catch (error) {
-    console.error('⚠️ Event cleanup failed:', error.message);
-  }
-}
-
 const PORT = process.env.PORT || 3000;
 
-app.listen(PORT, '0.0.0.0', () => {
+// ---- Event cleanup cron ----
+// Runs every 15 minutes while the service is awake, in IST
+cron.schedule(
+  '*/15 * * * *',
+  async () => {
+    console.log('⏰ Cron triggered');
+    await cleanupExpiredEvents();
+  },
+  {
+    timezone: 'Asia/Kolkata'
+  }
+);
+
+app.listen(PORT, '0.0.0.0', async () => {
   console.log(`🚀 Server running on port ${PORT}`);
 
-  // Run every 15 minutes, and once immediately on startup
-  cron.schedule('*/15 * * * *', cleanupExpiredEvents);
-  cleanupExpiredEvents();
+  console.log('🧹 Running startup event cleanup...');
+  await cleanupExpiredEvents();
 });
