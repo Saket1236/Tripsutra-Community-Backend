@@ -6,6 +6,7 @@ const express = require('express');
 const cors = require('cors');
 const pool = require('./db');
 const cloudinary = require('./cloudinary');
+const cron = require('node-cron');
 
 const app = express();
 
@@ -16,6 +17,13 @@ app.use(express.json());
 if (!process.env.CLOUDINARY_API_KEY || !process.env.CLOUDINARY_API_SECRET) {
   console.error('❌ Missing Cloudinary credentials in environment variables');
 }
+
+// ---- Categories (keep in sync with Flutter's _kAllCategories) ----
+const ALLOWED_CATEGORIES = [
+  'Food', 'Attraction', 'Monument', 'Nature',
+  'Trekking Spot', 'Waterfall', 'Temple', 'Park', 'Auditorium',
+  'Event'
+];
 
 // ---- Helpers ----
 function getPublicIdFromUrl(url) {
@@ -52,7 +60,6 @@ app.get('/', (req, res) => {
 
 app.post('/spots', async (req, res) => {
   try {
-
     console.log('📥 POST Request Received');
     console.log(req.body);
 
@@ -65,13 +72,29 @@ app.post('/spots', async (req, res) => {
       map_link,
       location_label,
       image_url,
-      submitted_by_email
+      submitted_by_email,
+      event_date,
+      event_time
     } = req.body;
 
     if (!title || !image_url) {
       return res.status(400).json({
         success: false,
         error: 'title and image_url are required'
+      });
+    }
+
+    if (!ALLOWED_CATEGORIES.includes(category)) {
+      return res.status(400).json({
+        success: false,
+        error: `Invalid category. Must be one of: ${ALLOWED_CATEGORIES.join(', ')}`
+      });
+    }
+
+    if (category === 'Event' && (!event_date || !event_time)) {
+      return res.status(400).json({
+        success: false,
+        error: 'event_date and event_time are required for Event category'
       });
     }
 
@@ -87,10 +110,12 @@ app.post('/spots', async (req, res) => {
         map_link,
         location_label,
         image_url,
-        submitted_by_email
+        submitted_by_email,
+        event_date,
+        event_time
       )
       VALUES
-      ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+      ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
       RETURNING *
       `,
       [
@@ -102,7 +127,9 @@ app.post('/spots', async (req, res) => {
         map_link,
         location_label,
         image_url,
-        submitted_by_email
+        submitted_by_email,
+        category === 'Event' ? event_date : null,
+        category === 'Event' ? event_time : null
       ]
     );
 
@@ -113,7 +140,7 @@ app.post('/spots', async (req, res) => {
       data: result.rows[0]
     });
 
-} catch (error) {
+  } catch (error) {
     console.error('❌ ERROR');
     console.error(error);
 
@@ -207,6 +234,55 @@ app.delete('/delete-spot/:id', async (req, res) => {
   }
 });
 
+// Admin: edit a spot's title/category/description (works for pending or approved)
+app.put('/edit-spot/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { title, category, description, event_date, event_time } = req.body;
+
+    if (!title) {
+      return res.status(400).json({ success: false, error: 'title is required' });
+    }
+
+    if (!ALLOWED_CATEGORIES.includes(category)) {
+      return res.status(400).json({
+        success: false,
+        error: `Invalid category. Must be one of: ${ALLOWED_CATEGORIES.join(', ')}`
+      });
+    }
+
+    if (category === 'Event' && (!event_date || !event_time)) {
+      return res.status(400).json({
+        success: false,
+        error: 'event_date and event_time are required for Event category'
+      });
+    }
+
+    const result = await pool.query(
+      `UPDATE spots
+       SET title=$1, category=$2, description=$3, event_date=$4, event_time=$5
+       WHERE id=$6
+       RETURNING *`,
+      [
+        title,
+        category,
+        description ?? '',
+        category === 'Event' ? event_date : null,
+        category === 'Event' ? event_time : null,
+        id
+      ]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, error: 'Spot not found' });
+    }
+
+    res.json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 app.get('/spots/user', async (req, res) => {
   try {
     const email = req.query.email;
@@ -249,8 +325,36 @@ app.delete('/spots/user/:id', async (req, res) => {
   }
 });
 
+async function cleanupExpiredEvents() {
+  try {
+    const result = await pool.query(
+      `SELECT * FROM spots
+       WHERE category = 'Event'
+       AND event_date IS NOT NULL
+       AND event_time IS NOT NULL
+       AND (event_date + event_time::interval) < NOW()`
+    );
+
+    for (const spot of result.rows) {
+      await deleteImageIfExists(spot.image_url);
+      await pool.query('DELETE FROM spots WHERE id=$1', [spot.id]);
+      console.log(`🗑️ Expired event deleted: ${spot.title} (id: ${spot.id})`);
+    }
+
+    if (result.rows.length > 0) {
+      console.log(`✅ Cleanup complete: ${result.rows.length} expired event(s) removed`);
+    }
+  } catch (error) {
+    console.error('⚠️ Event cleanup failed:', error.message);
+  }
+}
+
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 Server running on port ${PORT}`);
+
+  // Run every 15 minutes, and once immediately on startup
+  cron.schedule('*/15 * * * *', cleanupExpiredEvents);
+  cleanupExpiredEvents();
 });
