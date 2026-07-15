@@ -379,6 +379,117 @@ app.delete('/spots/user/:id', async (req, res) => {
   }
 });
 
+
+// ─────────────────────────────────────────────────────────
+// TRAVEL SHORTS
+// ─────────────────────────────────────────────────────────
+
+// Public: only active shorts, ordered — used by the Flutter app
+app.get('/travel-shorts', async (req, res) => {
+  try {
+    const result = await pool.query(
+      "SELECT * FROM travel_shorts WHERE is_active=true ORDER BY display_order ASC, id ASC"
+    );
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Admin: all shorts (active + hidden) — used by the admin panel
+app.get('/admin/travel-shorts', async (req, res) => {
+  try {
+    const result = await pool.query(
+      "SELECT * FROM travel_shorts ORDER BY display_order ASC, id ASC"
+    );
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/travel-shorts', async (req, res) => {
+  try {
+    const { youtube_url, title } = req.body;
+    if (!youtube_url) {
+      return res.status(400).json({ error: 'youtube_url is required' });
+    }
+
+    const maxOrder = await pool.query(
+      'SELECT COALESCE(MAX(display_order), -1) AS max_order FROM travel_shorts'
+    );
+    const nextOrder = maxOrder.rows[0].max_order + 1;
+
+    const result = await pool.query(
+      `INSERT INTO travel_shorts (youtube_url, title, is_active, display_order)
+       VALUES ($1, $2, true, $3) RETURNING *`,
+      [youtube_url, title || null, nextOrder]
+    );
+
+    res.status(201).json(result.rows[0]);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Partial update — any field left out of the body keeps its current value
+app.put('/travel-shorts/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const existing = await pool.query('SELECT * FROM travel_shorts WHERE id=$1', [id]);
+    if (existing.rows.length === 0) {
+      return res.status(404).json({ error: 'Short not found' });
+    }
+    const current = existing.rows[0];
+
+    const youtube_url  = req.body.youtube_url  ?? current.youtube_url;
+    const title        = req.body.title        ?? current.title;
+    const is_active    = req.body.is_active    ?? current.is_active;
+    const display_order = req.body.display_order ?? current.display_order;
+
+    const result = await pool.query(
+      `UPDATE travel_shorts
+       SET youtube_url=$1, title=$2, is_active=$3, display_order=$4
+       WHERE id=$5 RETURNING *`,
+      [youtube_url, title, is_active, display_order, id]
+    );
+
+    res.json(result.rows[0]);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.patch('/travel-shorts/:id/status', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { is_active } = req.body;
+    const result = await pool.query(
+      'UPDATE travel_shorts SET is_active=$1 WHERE id=$2 RETURNING *',
+      [is_active, id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Short not found' });
+    }
+    res.json(result.rows[0]);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.delete('/travel-shorts/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const result = await pool.query('DELETE FROM travel_shorts WHERE id=$1 RETURNING *', [id]);
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Short not found' });
+    }
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 const PORT = process.env.PORT || 3000;
 
 // ---- Event cleanup cron ----
